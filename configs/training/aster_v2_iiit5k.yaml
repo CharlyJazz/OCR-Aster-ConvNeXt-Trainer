@@ -1,0 +1,77 @@
+# =============================================================================
+# ASTER v2 — v0.1 baseline on IIIT5K-Words
+# Architecture: ConvNeXt → BiLSTM → ASTER Attention Decoder (v2)
+# Dataset: jlbaker361/new_iiit5k_words (HuggingFace, streaming)
+# =============================================================================
+
+experiment_name: "aster-v2-iiit5k-baseline"
+
+# ── Model geometry ────────────────────────────────────────────────────────────
+imgH: 32
+imgW: 128
+input_channel: 1
+output_channel: 512
+hidden_size: 512
+embed_dim: 256
+batch_max_length: 25
+sensitive: false
+
+character: "0123456789abcdefghijklmnopqrstuvwxyz"
+
+# ── Scheduled teacher forcing ─────────────────────────────────────────────────
+tf_start: 1.0
+tf_end: 0.3
+tf_decay_iters: 25000
+
+# ── Training ──────────────────────────────────────────────────────────────────
+batch_size: 32
+num_iter: 50000
+lr: 0.0001625
+weight_decay: 0.02
+beta1: 0.9
+beta2: 0.999
+eps: 1.0e-8
+grad_clip: 1.0
+manualSeed: 1111
+
+# ── Checkpointing ─────────────────────────────────────────────────────────────
+checkpoints_dir: "checkpoints/aster-v2-iiit5k-baseline"
+saved_model: ""
+save_every_n_iterations: 5000
+valInterval: 5000
+save_metrics_csv_every: 100
+save_log_gradient_every: 100
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+datasets:
+  - repo_id: "jlbaker361/new_iiit5k_words"
+    split: "train"
+    weight: 1.0
+    image_column: "image"
+    label_column: "label"
+    streaming: true
+
+val_dataset:
+  repo_id: "jlbaker361/new_iiit5k_words"
+  split: "test"
+  image_column: "image"
+  label_column: "label"
+  streaming: false
+
+# ── Curriculum (none for v0.1 baseline) ───────────────────────────────────────
+phases: []
+
+# ── Augmentation ──────────────────────────────────────────────────────────────
+augmentation:
+  enabled: true
+  level: "low"
+
+# ── MLflow ────────────────────────────────────────────────────────────────────
+mlflow:
+  enabled: true
+  tracking_uri: "mlruns/"
+  experiment_name: "aster-v2-iiit5k"
+  run_name: "baseline-v01"
+  tags:
+    dataset: "iiit5k"
+    architecture: "convnext+bilstm+aster_v2"

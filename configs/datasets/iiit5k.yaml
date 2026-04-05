@@ -1,0 +1,18 @@
+# IIIT5K-Words — small scene text dataset, good for v0.1 baseline
+# https://huggingface.co/datasets/jlbaker361/new_iiit5k_words
+# 6,000 word images, 62-character vocabulary (digits + upper + lower)
+
+datasets:
+  - repo_id: "jlbaker361/new_iiit5k_words"
+    split: "train"
+    weight: 1.0
+    image_column: "image"
+    label_column: "label"
+    streaming: true
+
+val_dataset:
+  repo_id: "jlbaker361/new_iiit5k_words"
+  split: "test"
+  image_column: "image"
+  label_column: "label"
+  streaming: false

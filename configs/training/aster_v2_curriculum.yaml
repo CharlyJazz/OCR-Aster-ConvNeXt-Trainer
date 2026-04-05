@@ -1,0 +1,89 @@
+# =============================================================================
+# ASTER v2 — multi-phase curriculum example
+# =============================================================================
+
+experiment_name: "aster-v2-curriculum"
+
+imgH: 120
+imgW: 280
+input_channel: 1
+output_channel: 512
+hidden_size: 512
+embed_dim: 256
+batch_max_length: 28
+sensitive: true
+
+character: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ#()+,-_/"
+
+tf_start: 1.0
+tf_end: 0.3
+tf_decay_iters: 300000
+
+batch_size: 32
+num_iter: 1000000
+lr: 0.0001625
+weight_decay: 0.02
+beta1: 0.9
+beta2: 0.999
+eps: 1.0e-8
+grad_clip: 1.0
+manualSeed: 1111
+
+checkpoints_dir: "checkpoints/aster-v2-curriculum"
+saved_model: ""
+save_every_n_iterations: 10000
+valInterval: 25000
+save_metrics_csv_every: 100
+save_log_gradient_every: 100
+
+datasets:
+  - repo_id: "user/my-ocr-dataset"
+    split: "train"
+    weight: 1.0
+    image_column: "image"
+    label_column: "label"
+    streaming: true
+
+val_dataset:
+  repo_id: "user/my-ocr-dataset"
+  split: "validation"
+  image_column: "image"
+  label_column: "label"
+  streaming: false
+
+phases:
+  - name: "phase_1_short"
+    from_iter: 0
+    to_iter: 100000
+    batch_size: 32
+    lr: 0.0001625
+    augmentation_level: "low"
+    dataset_filter: "lambda s: len(s['label']) <= 6"
+
+  - name: "phase_2_medium"
+    from_iter: 100000
+    to_iter: 400000
+    batch_size: 32
+    lr: 0.0001
+    augmentation_level: "medium"
+    dataset_filter: "lambda s: len(s['label']) <= 12"
+
+  - name: "phase_3_full"
+    from_iter: 400000
+    to_iter: 1000000
+    batch_size: 32
+    lr: 0.0001
+    augmentation_level: "high"
+    dataset_filter: null
+
+augmentation:
+  enabled: true
+  level: "medium"
+
+mlflow:
+  enabled: true
+  tracking_uri: "mlruns/"
+  experiment_name: "aster-v2-curriculum"
+  run_name: "3phase"
+  tags:
+    architecture: "convnext+bilstm+aster_v2"
