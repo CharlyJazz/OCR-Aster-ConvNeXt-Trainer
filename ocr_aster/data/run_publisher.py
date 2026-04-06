@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="ocr-publish",
-        description="Stream HuggingFace → augment → publish to Redis for ocr-train.",
+        description="Stream HuggingFace -> augment -> publish to Redis for ocr-train.",
     )
     parser.add_argument(
         "--config",
