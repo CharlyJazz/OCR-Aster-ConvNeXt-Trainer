@@ -39,6 +39,7 @@ when resuming or comparing checkpoints.
 
 from __future__ import annotations
 
+import csv
 import logging
 import re
 import signal
@@ -188,6 +189,61 @@ def _build_val_dataloader(config: TrainingConfig) -> torch.utils.data.DataLoader
     )
 
 
+def _grad_norm(model: nn.Module) -> float:
+    """Compute total L2 gradient norm across all parameters."""
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total += p.grad.data.norm(2).item() ** 2
+    return total ** 0.5
+
+
+def _init_metrics_csv(path: Path) -> None:
+    """Create metrics CSV with header if it doesn't exist yet."""
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "iteration", "train_loss", "grad_norm", "learning_rate",
+            "tf_ratio",
+            "val_accuracy", "val_norm_ed", "val_cer", "val_loss",
+            "avg_conf_correct", "avg_conf_incorrect", "calibration_gap",
+            "acc_1_5", "acc_6_10", "acc_11_20", "acc_21plus",
+        ])
+
+
+def _append_train_row(
+    path: Path, iteration: int, loss: float, grad_norm: float,
+    lr: float, tf_ratio: float,
+) -> None:
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            iteration, f"{loss:.6f}", f"{grad_norm:.6f}", f"{lr:.8f}",
+            f"{tf_ratio:.4f}",
+            "", "", "", "", "", "", "", "", "", "", "",
+        ])
+
+
+def _append_val_row(
+    path: Path, iteration: int, loss: float, grad_norm: float,
+    lr: float, tf_ratio: float, result: "ValidationResult",
+) -> None:
+    abl = result.accuracy_by_length
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            iteration,
+            f"{loss:.6f}", f"{grad_norm:.6f}", f"{lr:.8f}", f"{tf_ratio:.4f}",
+            f"{result.accuracy:.6f}", f"{result.norm_edit_distance:.6f}",
+            f"{result.cer:.6f}", f"{result.val_loss:.6f}",
+            f"{result.avg_conf_correct:.6f}", f"{result.avg_conf_incorrect:.6f}",
+            f"{result.calibration_gap:.6f}",
+            f"{abl.get('1-5', 0.0):.4f}", f"{abl.get('6-10', 0.0):.4f}",
+            f"{abl.get('11-20', 0.0):.4f}", f"{abl.get('21+', 0.0):.4f}",
+        ])
+
+
 # ---------------------------------------------------------------------------
 # Main training function
 # ---------------------------------------------------------------------------
@@ -220,7 +276,9 @@ def train(config_path: str) -> None:
 
     log_dir = Path(config.checkpoints_dir) / config.experiment_name
     log_dir.mkdir(parents=True, exist_ok=True)
-    val_log_path = log_dir / "validation_log.txt"
+    val_log_path    = log_dir / "validation_log.txt"
+    metrics_csv_path = log_dir / f"training_metrics_{config.experiment_name}.csv"
+    _init_metrics_csv(metrics_csv_path)
 
     # ── 2. Model ───────────────────────────────────────────────────────────
     model = _build_model(config, device)
@@ -274,7 +332,9 @@ def train(config_path: str) -> None:
         )
 
     # ── 6. Data ────────────────────────────────────────────────────────────
+    # publisher is re-assigned on batch_size phase changes — keep reference via list
     publisher = HFPublisher(config=config, batch_size=config.batch_size, augment=True)
+    _pub = [publisher]  # mutable container so SIGINT handler always sees current ref
     val_loader = _build_val_dataloader(config)
     collate    = AlignCollate(imgH=config.imgH, imgW=config.imgW)
     loss_avg   = Averager()
@@ -300,7 +360,7 @@ def train(config_path: str) -> None:
             config=config,
             checkpoint_type="interrupt",
         )
-        publisher.stop()
+        _pub[0].stop()
         if tracker:
             tracker.finish()
         logger.info("Interrupt checkpoint saved. Exiting.")
@@ -329,9 +389,24 @@ def train(config_path: str) -> None:
                     f"iters [{phase.from_iter:,}–{phase.to_iter:,}]  "
                     f"lr={phase.lr}  batch_size={phase.batch_size}"
                 )
+                # Update learning rate
                 for pg in optimizer.param_groups:
                     pg["lr"] = phase.lr
+                # Rebuild augmentation pipeline for this phase
                 publisher.update_phase(iteration)
+                # Update batch size: restart publisher if it changed
+                if phase.batch_size != publisher._batch_size:
+                    logger.info(
+                        f"Batch size change: {publisher._batch_size} → {phase.batch_size}"
+                    )
+                    publisher.stop()
+                    publisher = HFPublisher(
+                        config=config,
+                        batch_size=phase.batch_size,
+                        augment=True,
+                    )
+                    publisher.update_phase(iteration)
+                    _pub[0] = publisher  # keep SIGINT handler in sync
             _prev_phase_name = phase_name
 
         # ── Forward + backward ────────────────────────────────────────────
@@ -355,21 +430,27 @@ def train(config_path: str) -> None:
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
+        grad_norm = _grad_norm(model)
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         scaler.step(optimizer)
         scaler.update()
 
         loss_avg.add(loss.item())
+        current_lr = optimizer.param_groups[0]["lr"]
 
         # ── Step logging ──────────────────────────────────────────────────
         if iteration % config.save_log_gradient_every == 0:
             logger.info(
                 f"[{iteration:>7,}/{config.num_iter:,}] "
-                f"loss={loss_avg.val():.4f}  τ={tf_ratio:.3f}  "
-                f"lr={optimizer.param_groups[0]['lr']:.2e}"
+                f"loss={loss_avg.val():.4f}  grad={grad_norm:.3f}  "
+                f"τ={tf_ratio:.3f}  lr={current_lr:.2e}"
             )
             if tracker:
                 tracker.log_train_step(iteration=iteration, loss=loss_avg.val(), tf_ratio=tf_ratio)
+            _append_train_row(
+                metrics_csv_path, iteration, loss_avg.val(),
+                grad_norm, current_lr, tf_ratio,
+            )
             loss_avg.reset()
 
         # ── Validation ────────────────────────────────────────────────────
@@ -387,6 +468,10 @@ def train(config_path: str) -> None:
 
             logger.info(result.summary())
             write_report(result, val_log_path)
+            _append_val_row(
+                metrics_csv_path, iteration, result.val_loss,
+                grad_norm, current_lr, tf_ratio, result,
+            )
             if tracker:
                 tracker.log_validation(result)
 
@@ -420,7 +505,7 @@ def train(config_path: str) -> None:
             )
 
     # ── 9. Final save ──────────────────────────────────────────────────────
-    publisher.stop()
+    _pub[0].stop()
     save_checkpoint(
         log_dir / "final_model.pth",
         model, optimizer, scaler, config.num_iter,
