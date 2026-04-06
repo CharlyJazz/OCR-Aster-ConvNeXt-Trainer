@@ -7,7 +7,7 @@ Called by ocr_aster/train/run.py CLI.
 Flow:
   1. Load & validate YAML config
   2. Build model (ConvNeXt → BiLSTM → ASTER v2)
-  3. Start HFPublisher (background data thread)
+  3. Connect RedisConsumerDataset — wait for publisher to have data
   4. Optionally resume from checkpoint
   5. Register SIGINT handler — Ctrl+C saves an interrupt checkpoint cleanly
   6. Training loop:
@@ -18,23 +18,31 @@ Flow:
        - save periodic checkpoints
   7. Save final model
 
+Data pipeline:
+  Publisher process (ocr-publish) → Redis → RedisConsumerDataset → DataLoader
+  → AlignCollate → (B, 1, H, W) tensors + label strings → training loop
+
+  Start the publisher BEFORE the trainer:
+      Terminal 1:  ocr-publish --config <path>
+      Terminal 2:  ocr-train   --config <path>
+
 Checkpoint format (all saves use the same schema via save_checkpoint()):
     {
-        "model":          model.state_dict(),
-        "optimizer":      optimizer.state_dict(),
-        "scaler":         scaler.state_dict(),
-        "iteration":      int,
-        "best_accuracy":  float,
-        "best_norm_ed":   float,
+        "model":           model.state_dict(),
+        "optimizer":       optimizer.state_dict(),
+        "scaler":          scaler.state_dict(),
+        "iteration":       int,
+        "best_accuracy":   float,
+        "best_norm_ed":    float,
         "experiment_name": str,
-        "num_class":      int,
-        "character":      str,
+        "num_class":       int,
+        "character":       str,
+        "imgH":            int,
+        "imgW":            int,
+        "batch_max_length": int,
         "checkpoint_type": "periodic" | "best_accuracy" | "best_norm_ed"
                          | "interrupt" | "final",
     }
-
-Every .pth produced by this loop has identical keys and sizes — no surprises
-when resuming or comparing checkpoints.
 """
 
 from __future__ import annotations
@@ -50,12 +58,13 @@ from typing import Literal
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 
 from ocr_aster.config.loader import load_config
 from ocr_aster.config.schema import TrainingConfig
 from ocr_aster.data.collate import AlignCollate
+from ocr_aster.data.consumer import RedisConsumerDataset
 from ocr_aster.data.dataset import HFValDataset
-from ocr_aster.data.publisher import HFPublisher
 from ocr_aster.model.model import AsterConvNeXt
 from ocr_aster.monitoring.tracker import ExperimentTracker
 from ocr_aster.train.forward_pass import forward_pass
@@ -90,17 +99,6 @@ def save_checkpoint(
     Every .pth file written during a training run has the exact same set of
     keys, so file sizes are comparable and resuming never fails due to missing
     fields.
-
-    Args:
-        path:            destination .pth file path
-        model:           AsterConvNeXt instance
-        optimizer:       AdamW optimiser
-        scaler:          AMP GradScaler
-        iteration:       current training iteration
-        best_accuracy:   best exact-match accuracy seen so far
-        best_norm_ed:    best normalised edit distance seen so far
-        config:          full TrainingConfig (provides experiment metadata)
-        checkpoint_type: label stored in the file — useful for inspection
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -110,10 +108,10 @@ def save_checkpoint(
             "optimizer":      optimizer.state_dict(),
             "scaler":         scaler.state_dict(),
             "iteration":      iteration,
-            # ── Best metrics (so resume can restore the tracker values) ──
+            # ── Best metrics ─────────────────────────────────────────────
             "best_accuracy":  best_accuracy,
             "best_norm_ed":   best_norm_ed,
-            # ── Experiment metadata (same for every ckpt in a run) ───────
+            # ── Experiment metadata ───────────────────────────────────────
             "experiment_name": config.experiment_name,
             "num_class":       config.num_class,
             "character":       config.character,
@@ -129,7 +127,7 @@ def save_checkpoint(
 
 
 # ---------------------------------------------------------------------------
-# Other helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _build_model(config: TrainingConfig, device: torch.device) -> AsterConvNeXt:
@@ -152,23 +150,14 @@ def _resume_from_checkpoint(
     scaler: torch.amp.GradScaler,
     device: torch.device,
 ) -> tuple[int, float, float]:
-    """
-    Load checkpoint state into model/optimizer/scaler.
-
-    Returns:
-        (start_iteration, best_accuracy, best_norm_ed)
-    """
     logger.info(f"Resuming from {path}")
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scaler.load_state_dict(ckpt["scaler"])
 
-    # Iteration: filename is canonical (safer than the stored value if file
-    # was manually renamed), fall back to stored value.
     match = re.search(r"iter_(\d+)\.pth", path)
-    iteration = int(match.group(1)) if match else ckpt.get("iteration", 0)
-
+    iteration    = int(match.group(1)) if match else ckpt.get("iteration", 0)
     best_accuracy = ckpt.get("best_accuracy", 0.0)
     best_norm_ed  = ckpt.get("best_norm_ed", 0.0)
     return iteration, best_accuracy, best_norm_ed
@@ -180,17 +169,30 @@ def _count_parameters(model: nn.Module) -> int:
     return n
 
 
-def _build_val_dataloader(config: TrainingConfig) -> torch.utils.data.DataLoader:
+def _build_val_dataloader(config: TrainingConfig) -> DataLoader:
     collate = AlignCollate(imgH=config.imgH, imgW=config.imgW)
     ds = HFValDataset(src=config.val_dataset, imgH=config.imgH, imgW=config.imgW)
-    return torch.utils.data.DataLoader(
+    return DataLoader(
         ds, batch_size=config.batch_size, shuffle=False,
         num_workers=0, collate_fn=collate,
     )
 
 
+def _build_train_dataloader(
+    consumer_ds: RedisConsumerDataset,
+    collate: AlignCollate,
+    batch_size: int,
+) -> DataLoader:
+    return DataLoader(
+        consumer_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,   # Windows-safe; Redis I/O is the bottleneck, not workers
+        collate_fn=collate,
+    )
+
+
 def _grad_norm(model: nn.Module) -> float:
-    """Compute total L2 gradient norm across all parameters."""
     total = 0.0
     for p in model.parameters():
         if p.grad is not None:
@@ -199,7 +201,6 @@ def _grad_norm(model: nn.Module) -> float:
 
 
 def _init_metrics_csv(path: Path) -> None:
-    """Create metrics CSV with header if it doesn't exist yet."""
     if path.exists():
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -252,8 +253,8 @@ def train(config_path: str) -> None:
     """
     Full training run from a YAML config path.
 
-    Args:
-        config_path: path to a TrainingConfig YAML file
+    Expects the publisher (ocr-publish) to already be running and feeding
+    Redis before this is called.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -263,7 +264,7 @@ def train(config_path: str) -> None:
 
     # ── 1. Config ──────────────────────────────────────────────────────────
     config = load_config(config_path)
-    char_set = config.build_character_set()
+    char_set  = config.build_character_set()
     converter = AttnLabelConverter(char_set)
     config.num_class = converter.num_class
 
@@ -276,12 +277,12 @@ def train(config_path: str) -> None:
 
     log_dir = Path(config.checkpoints_dir) / config.experiment_name
     log_dir.mkdir(parents=True, exist_ok=True)
-    val_log_path    = log_dir / "validation_log.txt"
+    val_log_path     = log_dir / "validation_log.txt"
     metrics_csv_path = log_dir / f"training_metrics_{config.experiment_name}.csv"
     _init_metrics_csv(metrics_csv_path)
 
     # ── 2. Model ───────────────────────────────────────────────────────────
-    model = _build_model(config, device)
+    model      = _build_model(config, device)
     num_params = _count_parameters(model)
 
     # ── 3. Optimiser + scaler ──────────────────────────────────────────────
@@ -331,23 +332,44 @@ def train(config_path: str) -> None:
             },
         )
 
-    # ── 6. Data ────────────────────────────────────────────────────────────
-    # publisher is re-assigned on batch_size phase changes — keep reference via list
-    publisher = HFPublisher(config=config, batch_size=config.batch_size, augment=True)
-    _pub = [publisher]  # mutable container so SIGINT handler always sees current ref
-    val_loader = _build_val_dataloader(config)
-    collate    = AlignCollate(imgH=config.imgH, imgW=config.imgW)
-    loss_avg   = Averager()
+    # ── 6. Data — connect to Redis (publisher must already be running) ──────
+    rc = config.redis
+    logger.info(f"Connecting to Redis at {rc.host}:{rc.port}…")
+    try:
+        consumer_ds = RedisConsumerDataset(
+            redis_host=rc.host,
+            redis_port=rc.port,
+            redis_db=rc.db,
+        )
+    except ConnectionError as exc:
+        logger.error(
+            f"Cannot connect to Redis: {exc}\n"
+            f"Start the publisher first:  ocr-publish --config {config_path}"
+        )
+        sys.exit(1)
 
-    # ── 7. SIGINT handler (Ctrl+C → interrupt checkpoint) ──────────────────
-    # Mutable container so the nested function can write to it
+    if not consumer_ds.wait_for_images(min_images=config.batch_size, timeout=120):
+        logger.error(
+            "Publisher has no data in Redis after 120 s.\n"
+            f"Start it with:  ocr-publish --config {config_path}"
+        )
+        sys.exit(1)
+
+    collate       = AlignCollate(imgH=config.imgH, imgW=config.imgW)
+    current_bs    = config.batch_size
+    train_loader  = _build_train_dataloader(consumer_ds, collate, current_bs)
+    train_iter    = iter(train_loader)
+    val_loader    = _build_val_dataloader(config)
+    loss_avg      = Averager()
+
+    # ── 7. SIGINT handler ──────────────────────────────────────────────────
     _state = {"iteration": start_iter, "interrupted": False}
 
     def _handle_sigint(sig, frame):  # noqa: ANN001
         if _state["interrupted"]:
-            logger.warning("Second interrupt — forcing exit without saving.")
+            logger.warning("Second interrupt — forcing exit.")
             sys.exit(1)
-        logger.warning("Interrupt received — saving checkpoint before exit...")
+        logger.warning("Interrupt — saving checkpoint before exit…")
         _state["interrupted"] = True
         save_checkpoint(
             path=log_dir / f"interrupt_iter_{_state['iteration']}.pth",
@@ -360,7 +382,6 @@ def train(config_path: str) -> None:
             config=config,
             checkpoint_type="interrupt",
         )
-        _pub[0].stop()
         if tracker:
             tracker.finish()
         logger.info("Interrupt checkpoint saved. Exiting.")
@@ -371,7 +392,8 @@ def train(config_path: str) -> None:
     # ── 8. Training loop ───────────────────────────────────────────────────
     logger.info(
         f"Training '{config.experiment_name}' "
-        f"[{start_iter:,} → {config.num_iter:,} iters]"
+        f"[{start_iter:,} → {config.num_iter:,} iters]  "
+        f"redis={rc.host}:{rc.port}"
     )
     model.train()
     _prev_phase_name: str | None = None
@@ -380,7 +402,7 @@ def train(config_path: str) -> None:
         _state["iteration"] = iteration
 
         # ── Phase transition ───────────────────────────────────────────────
-        phase = config.active_phase(iteration)
+        phase      = config.active_phase(iteration)
         phase_name = phase.name if phase else None
         if phase_name != _prev_phase_name:
             if phase is not None:
@@ -389,32 +411,27 @@ def train(config_path: str) -> None:
                     f"iters [{phase.from_iter:,}–{phase.to_iter:,}]  "
                     f"lr={phase.lr}  batch_size={phase.batch_size}"
                 )
-                # Update learning rate
                 for pg in optimizer.param_groups:
                     pg["lr"] = phase.lr
-                # Rebuild augmentation pipeline for this phase
-                publisher.update_phase(iteration)
-                # Update batch size: restart publisher if it changed
-                if phase.batch_size != publisher._batch_size:
-                    logger.info(
-                        f"Batch size change: {publisher._batch_size} → {phase.batch_size}"
-                    )
-                    publisher.stop()
-                    publisher = HFPublisher(
-                        config=config,
-                        batch_size=phase.batch_size,
-                        augment=True,
-                    )
-                    publisher.update_phase(iteration)
-                    _pub[0] = publisher  # keep SIGINT handler in sync
+
+                # Rebuild DataLoader if batch_size changes
+                if phase.batch_size != current_bs:
+                    logger.info(f"Batch size: {current_bs} → {phase.batch_size}")
+                    current_bs   = phase.batch_size
+                    train_loader = _build_train_dataloader(consumer_ds, collate, current_bs)
+                    train_iter   = iter(train_loader)
+
             _prev_phase_name = phase_name
 
-        # ── Forward + backward ────────────────────────────────────────────
-        raw_batch = publisher.get_batch()
-        images_pil, label_strings_raw = zip(*raw_batch)
-        images_tensor, label_strings = collate(list(zip(images_pil, label_strings_raw)))
+        # ── Fetch next batch from Redis consumer ───────────────────────────
+        try:
+            images_tensor, label_strings = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            images_tensor, label_strings = next(train_iter)
         images_tensor = images_tensor.to(device)
 
+        # ── Forward + backward ────────────────────────────────────────────
         text_for_pred, text_for_loss, lengths = converter.encode(
             list(label_strings), config.batch_max_length
         )
@@ -447,7 +464,9 @@ def train(config_path: str) -> None:
                 f"τ={tf_ratio:.3f}  lr={current_lr:.2e}"
             )
             if tracker:
-                tracker.log_train_step(iteration=iteration, loss=loss_avg.val(), tf_ratio=tf_ratio)
+                tracker.log_train_step(
+                    iteration=iteration, loss=loss_avg.val(), tf_ratio=tf_ratio
+                )
             _append_train_row(
                 metrics_csv_path, iteration, loss_avg.val(),
                 grad_norm, current_lr, tf_ratio,
@@ -506,7 +525,6 @@ def train(config_path: str) -> None:
             )
 
     # ── 9. Final save ──────────────────────────────────────────────────────
-    _pub[0].stop()
     save_checkpoint(
         log_dir / "final_model.pth",
         model, optimizer, scaler, config.num_iter,

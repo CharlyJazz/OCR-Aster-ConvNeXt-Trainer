@@ -1,80 +1,36 @@
 """
-HFOCRDataset — PyTorch IterableDataset backed by HFPublisher.
+Validation dataset and DataLoader builder.
 
-Yields (image_tensor, label_str) pairs.  The DataLoader wraps this with
-AlignCollate as the collate_fn to produce (B, 1, H, W) tensors.
+Training data comes from RedisConsumerDataset (consumer.py), which reads
+images pre-processed by the publisher (run_publisher.py).
 
-Validation datasets don't go through the publisher — they're loaded once
-as a regular (non-streaming) HF dataset and iterated in order.
+Validation data is loaded once from HuggingFace (non-streaming) and kept
+in memory for the full training run.
 """
 
 from __future__ import annotations
 
-from typing import Iterator
-
 import torch
 from PIL import Image
-from torch import Tensor
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 
 from ocr_aster.config.schema import DatasetSourceConfig, TrainingConfig
 from ocr_aster.data.collate import AlignCollate
-from ocr_aster.data.publisher import HFPublisher
+from ocr_aster.data.publisher import _pil_from_sample
 
 
 # ---------------------------------------------------------------------------
-# Training dataset (IterableDataset backed by HFPublisher)
-# ---------------------------------------------------------------------------
-
-class HFOCRDataset(IterableDataset):
-    """
-    PyTorch IterableDataset that pulls (PIL Image, label) pairs from an
-    HFPublisher one sample at a time.
-
-    The publisher runs in a background thread — calling __iter__ just
-    drains the queue.
-
-    Args:
-        publisher:   running HFPublisher instance
-        max_samples: stop after this many samples (None = infinite)
-    """
-
-    def __init__(
-        self,
-        publisher: HFPublisher,
-        max_samples: int | None = None,
-    ) -> None:
-        self._publisher = publisher
-        self._max_samples = max_samples
-        # Internal buffer — we receive full batches from publisher,
-        # but yield individual samples
-        self._buffer: list[tuple[Image.Image, str]] = []
-
-    def __iter__(self) -> Iterator[tuple[Image.Image, str]]:
-        count = 0
-        while True:
-            if self._max_samples is not None and count >= self._max_samples:
-                return
-
-            if not self._buffer:
-                self._buffer = self._publisher.get_batch()
-
-            yield self._buffer.pop(0)
-            count += 1
-
-
-# ---------------------------------------------------------------------------
-# Validation dataset (standard map-style, loaded once, no augmentation)
+# Validation dataset (map-style, loaded once, no augmentation)
 # ---------------------------------------------------------------------------
 
 class HFValDataset(torch.utils.data.Dataset):
     """
-    Non-streaming validation dataset.  Loads the full split into memory
+    Non-streaming validation dataset. Loads the full split into memory
     (suitable for typical val sets of a few thousand samples).
 
     Args:
-        src:          DatasetSourceConfig for the validation split
-        imgH, imgW:   resize target — must match training config
+        src:       DatasetSourceConfig for the validation split
+        imgH, imgW: kept for API compatibility — resize happens in AlignCollate
     """
 
     def __init__(
@@ -85,7 +41,7 @@ class HFValDataset(torch.utils.data.Dataset):
     ) -> None:
         from datasets import load_dataset
 
-        self._src = src
+        self._src  = src
         self._imgH = imgH
         self._imgW = imgW
 
@@ -102,8 +58,7 @@ class HFValDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int) -> tuple[Image.Image, str]:
         sample = self._samples[idx]
-        from ocr_aster.data.publisher import _pil_from_sample
-        img = _pil_from_sample(sample, self._src.image_column)
+        img    = _pil_from_sample(sample, self._src.image_column)
         label: str = sample.get(self._src.label_column, "")
         return img, label
 
@@ -122,17 +77,8 @@ def build_val_dataloader(
 
     Returns batches of (image_tensor B×1×H×W, label_strings list[str]).
     """
-    collate = AlignCollate(
-        imgH=config.imgH,
-        imgW=config.imgW,
-        keep_ratio=False,
-        adjust_contrast=False,
-    )
-    ds = HFValDataset(
-        src=config.val_dataset,
-        imgH=config.imgH,
-        imgW=config.imgW,
-    )
+    collate = AlignCollate(imgH=config.imgH, imgW=config.imgW)
+    ds = HFValDataset(src=config.val_dataset, imgH=config.imgH, imgW=config.imgW)
     return DataLoader(
         ds,
         batch_size=batch_size,

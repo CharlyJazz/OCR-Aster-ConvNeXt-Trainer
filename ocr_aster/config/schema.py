@@ -110,6 +110,24 @@ class PhaseConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Redis
+# ---------------------------------------------------------------------------
+
+class RedisConfig(BaseModel):
+    """Redis connection and publisher settings."""
+
+    model_config = {"extra": "forbid"}
+
+    host: str = "localhost"
+    port: int = 6379
+    db: int = 0
+    max_memory_mb: int = Field(1280, gt=0, description="Publisher stops filling Redis above this")
+    ttl_seconds: int = Field(14400, gt=0, description="Key TTL — 4 hours by default")
+    compress: bool = Field(False, description="zlib-compress pickled payloads")
+    n_workers: int = Field(4, gt=0, description="Augmentation threads inside the publisher")
+
+
+# ---------------------------------------------------------------------------
 # MLflow
 # ---------------------------------------------------------------------------
 
@@ -201,6 +219,9 @@ class TrainingConfig(BaseModel):
 
     # ── Augmentation ─────────────────────────────────────────────────────────
     augmentation: AugmentationConfig = Field(default_factory=AugmentationConfig)
+
+    # ── Redis ────────────────────────────────────────────────────────────────
+    redis: RedisConfig = Field(default_factory=RedisConfig)
 
     # ── MLflow ───────────────────────────────────────────────────────────────
     mlflow: MLflowConfig = Field(default_factory=MLflowConfig)
