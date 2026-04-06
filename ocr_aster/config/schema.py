@@ -121,7 +121,7 @@ class RedisConfig(BaseModel):
     host: str = "localhost"
     port: int = 6379
     db: int = 0
-    max_memory_mb: int = Field(1280, gt=0, description="Publisher stops filling Redis above this")
+    max_memory_mb: int = Field(30720, gt=0, description="Publisher stops filling Redis above this")
     ttl_seconds: int = Field(14400, gt=0, description="Key TTL — 4 hours by default")
     compress: bool = Field(False, description="zlib-compress pickled payloads")
     n_workers: int = Field(4, gt=0, description="Augmentation threads inside the publisher")
