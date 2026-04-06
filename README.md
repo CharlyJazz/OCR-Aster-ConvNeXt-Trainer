@@ -603,7 +603,7 @@ flowchart LR
 
 - [x] **0.1** Create repository, git init, initial commit, push to GitHub
 - [ ] **0.2** `requirements.txt` — torch, datasets, mlflow, pydantic, albumentations, editdistance, pyyaml, Pillow
-- [ ] **0.3** `pyproject.toml` — pip-installable package `ocr_aster`
+- [x] **0.3** `pyproject.toml` — pip-installable package `ocr_aster` (uv-managed)
 - [ ] **0.4** `.env.example` — HF_TOKEN, MLFLOW_TRACKING_URI, checkpoints dir
 - [ ] **0.5** `pre-commit` config — black, isort, mypy
 - [ ] **0.6** GitHub Actions: `test.yml` (pytest) + `lint.yml` (black + isort + mypy)
@@ -611,82 +611,82 @@ flowchart LR
 
 ---
 
-### PHASE 1 — Model: ConvNeXt Backbone
+### PHASE 1 — Model: ConvNeXt Backbone ✅
 
-- [ ] **1.1** `ocr_aster/model/convnext.py`
+- [x] **1.1** `ocr_aster/model/convnext.py`
   - Asymmetric downsampling: stride on H only after stem, preserve W → 35 temporal positions
   - Custom `LayerNorm` (no TIMM)
   - Custom `DropPath`
   - Input: `(B, 1, 120, 280)` → Output: `(T=35, B, 512)`
-- [ ] **1.2** `tests/test_convnext.py`
+- [x] **1.2** `tests/test_convnext.py`
   - Forward pass with dummy tensor, assert output shape `(35, B, 512)`
   - Verify no TIMM import anywhere in module
 
 ---
 
-### PHASE 2 — Model: BiLSTM Encoder
+### PHASE 2 — Model: BiLSTM Encoder ✅
 
-- [ ] **2.1** `ocr_aster/model/encoder.py`
+- [x] **2.1** `ocr_aster/model/encoder.py`
   - Input: `(T=35, B, 512)`
   - `LayerNorm` applied **before** LSTM (v2 addition)
   - 2-layer BiLSTM, hidden=512
   - Linear projection: concat(fwd, bwd) 1024 → 512
   - Output: `(T=35, B, 512)` encoded sequence + final hidden state
-- [ ] **2.2** `tests/test_encoder.py`
+- [x] **2.2** `tests/test_encoder.py`
   - Assert output shape and final hidden state shape
 
 ---
 
-### PHASE 3 — Model: ASTER v2 Attention Decoder
+### PHASE 3 — Model: ASTER v2 Attention Decoder ✅
 
-- [ ] **3.1** `ocr_aster/model/attention.py`
+- [x] **3.1** `ocr_aster/model/attention.py`
   - Additive (Bahdanau) attention: `e_ti = v · tanh(W_h·h + W_e·H_enc_i)`
   - **Cached encoder projection**: `W_e·H_enc` computed once per sequence, not per step
-- [ ] **3.2** `ocr_aster/model/decoder.py`
+- [x] **3.2** `ocr_aster/model/decoder.py`
   - GRU-based decoder
   - **Encoder→Decoder bridge**: init GRU hidden state from encoder final state (not zeros)
   - **Scheduled teacher forcing**: `τ(iter)` ratio passed in at train time
   - Input per step: `[context_t ; embed(y_{t-1})]` → GRU → FC → softmax
   - Output: `(B, max_len, num_class)` logits
-- [ ] **3.3** `ocr_aster/model/decoder.py` — inference mode
+- [x] **3.3** `ocr_aster/model/decoder.py` — inference mode
   - Greedy decoding: argmax at each step, feed prediction as next input
   - Stop at EOS token or `batch_max_length`
-- [ ] **3.4** `tests/test_decoder.py`
+- [x] **3.4** `tests/test_decoder.py`
   - Train mode: teacher forcing=1.0, check loss computes correctly
   - Inference mode: greedy decode, output length ≤ batch_max_length
   - Bridge init: decoder hidden ≠ zeros when encoder state passed
 
 ---
 
-### PHASE 4 — Model: Full Assembly
+### PHASE 4 — Model: Full Assembly ✅
 
-- [ ] **4.1** `ocr_aster/model/model.py` — `AsterConvNeXt` class
+- [x] **4.1** `ocr_aster/model/model.py` — `AsterConvNeXt` class
   - Compose: `ConvNeXt → LayerNorm → BiLSTM → ASTERv2Decoder`
   - `forward(images, labels=None, teacher_forcing_ratio=1.0)` → logits
   - `generate(images)` → decoded strings (greedy)
-- [ ] **4.2** `tests/test_model.py`
+- [x] **4.2** `tests/test_model.py`
   - End-to-end forward pass, batch of 4 images, training mode
   - End-to-end forward pass, inference mode
   - Check parameter count is reasonable
 
 ---
 
-### PHASE 5 — Configuration System
+### PHASE 5 — Configuration System ✅
 
-- [ ] **5.1** `ocr_aster/config/schema.py` — Pydantic v2:
+- [x] **5.1** `ocr_aster/config/schema.py` — Pydantic v2:
   - `TrainingConfig` — all training hyperparameters
   - `DatasetSourceConfig` — single HF dataset definition
   - `PhaseConfig` — curriculum learning phase
   - `MLflowConfig` — experiment tracking
   - `AugmentationConfig` — level + probabilities
-- [ ] **5.2** `ocr_aster/config/loader.py` — `load_config(path) → TrainingConfig`
+- [x] **5.2** `ocr_aster/config/loader.py` — `load_config(path) → TrainingConfig`
   - YAML → Pydantic, env var substitution (`${HF_TOKEN}`)
   - Unknown fields raise `ValidationError`
-- [ ] **5.3** `configs/training/aster_v2_iiit5k.yaml` — v0.1 ready-to-run config
-- [ ] **5.4** `configs/training/aster_v2_curriculum.yaml` — curriculum example
+- [x] **5.3** `configs/training/aster_v2_iiit5k.yaml` — v0.1 ready-to-run config
+- [x] **5.4** `configs/training/aster_v2_curriculum.yaml` — curriculum example
 - [ ] **5.5** `configs/datasets/iiit5k.yaml` — standalone dataset config
 - [ ] **5.6** `configs/datasets/multi_weighted.yaml` — multi-dataset example
-- [ ] **5.7** Unit tests: valid config loads, unknown field raises error, env var resolves
+- [x] **5.7** Unit tests: valid config loads, unknown field raises error, env var resolves
 
 ---
 
@@ -713,12 +713,12 @@ flowchart LR
 
 ---
 
-### PHASE 7 — Training Pipeline
+### PHASE 7 — Training Pipeline 🔄
 
-- [ ] **7.1** `ocr_aster/train/utils.py`
+- [x] **7.1** `ocr_aster/train/utils.py`
   - `AttnLabelConverter` — encode strings to index sequences, decode back
   - `Averager` — running average for loss/metrics
-- [ ] **7.2** `ocr_aster/train/forward_pass.py`
+- [x] **7.2** `ocr_aster/train/forward_pass.py`
   - `torch.amp.autocast` mixed precision
   - Compute attention CE loss with current `τ(iter)`
   - Return loss + predictions
@@ -732,42 +732,42 @@ flowchart LR
   - Log `teacher_forcing_ratio` to MLflow at every step
 - [ ] **7.5** `ocr_aster/train/run.py` — CLI entry point
   - `python -m ocr_aster.train.run --config configs/training/aster_v2_iiit5k.yaml`
-- [ ] **7.6** `tests/test_forward_pass.py` — loss computes, gradients flow, shapes correct
+- [x] **7.6** `tests/test_forward_pass.py` — loss computes, gradients flow, shapes correct
 - [ ] **7.7** `tests/test_label_converter.py` — encode/decode round-trip on edge cases
 
 ---
 
-### PHASE 8 — Validation & Metrics
+### PHASE 8 — Validation & Metrics ✅
 
-- [ ] **8.1** `ocr_aster/train/metrics.py` — all metric classes:
+- [x] **8.1** `ocr_aster/train/metrics.py` — all metric classes:
   - `ExactMatchAccuracy`
   - `CharacterErrorRate`
   - `NormEditDistance`
   - `AccuracyByLength`
   - `TopKCharacterConfusions`
   - `ConfidenceCalibration`
-- [ ] **8.2** `ocr_aster/train/validation.py`
+- [x] **8.2** `ocr_aster/train/validation.py`
   - Run model over full val split
   - Collect all metrics
   - Return structured `ValidationResult` dataclass
-- [ ] **8.3** `ocr_aster/train/validation_logger.py`
+- [x] **8.3** `ocr_aster/train/validation_logger.py`
   - Write `.txt` report to `checkpoints_dir/validation_log.txt`
   - Log all metrics + report to MLflow
-- [ ] **8.4** `tests/test_metrics.py` — all metrics with known inputs/expected outputs
+- [x] **8.4** `tests/test_metrics.py` — 34/34 tests passing
 
 ---
 
-### PHASE 9 — MLflow Integration
+### PHASE 9 — MLflow Integration 🔄
 
-- [ ] **9.1** `ocr_aster/monitoring/tracker.py` — `ExperimentTracker`
-  - `log_step(iter, loss, grad_norm, lr, tf_ratio)`
-  - `log_validation(iter, result: ValidationResult)`
-  - `log_config(config)` — YAML as artifact at run start
-  - `log_report(iter, report_path)`
-- [ ] **9.2** `scripts/start_mlflow.sh` + `scripts/start_mlflow.bat`
-- [ ] **9.3** `docker/mlflow/docker-compose.yml` — MLflow + PostgreSQL + MinIO
-- [ ] **9.4** `docs/mlflow_guide.md` — setup walkthrough + screenshots
-- [ ] **9.5** Integration test: 100-iter run, assert expected metrics are logged to MLflow
+- [x] **9.1** `ocr_aster/monitoring/tracker.py` — `ExperimentTracker`
+  - `log_train_step(iter, loss, tf_ratio)`
+  - `log_validation(result: ValidationResult)` — all metrics + by-length breakdown
+  - `log_artifact(path)` — file or directory upload
+  - Context-manager support (`with ExperimentTracker.start(...)`)
+- [ ] **9.2** `tests/test_tracker.py` — mock MLflow, assert correct calls
+- [ ] **9.3** `scripts/start_mlflow.sh` + `scripts/start_mlflow.bat`
+- [ ] **9.4** `docker/mlflow/docker-compose.yml` — MLflow + PostgreSQL + MinIO
+- [ ] **9.5** `docs/mlflow_guide.md` — setup walkthrough + screenshots
 
 ---
 
@@ -821,7 +821,7 @@ ocr-aster-convnext-trainer/
 │   │   ├── gradient_monitor.py   # Per-layer gradient norm monitoring
 │   │   └── utils.py              # AttnLabelConverter, Averager
 │   └── monitoring/
-│       └── tracker.py            # ExperimentTracker (MLflow wrapper)
+│       └── tracker.py            # ExperimentTracker — MLflow wrapper (log metrics, artifacts)
 ├── configs/
 │   ├── training/
 │   │   ├── aster_v2_iiit5k.yaml       # v0.1 baseline — ready to run
