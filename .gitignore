@@ -25,10 +25,10 @@ mlartifacts/
 .cache/
 hf_cache/
 
-# Data
+# Data (raw dataset directories at repo root only)
 *.lmdb
 *.mdb
-data/
+/data/
 
 # Notebooks
 .ipynb_checkpoints/
