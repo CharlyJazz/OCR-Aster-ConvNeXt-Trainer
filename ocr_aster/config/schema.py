@@ -174,6 +174,10 @@ class TrainingConfig(BaseModel):
     beta2: float = Field(0.999, gt=0.0, lt=1.0)
     eps: float = Field(1e-8, gt=0.0)
     grad_clip: float = Field(1.0, gt=0.0)
+    label_smoothing: float = Field(
+        0.0, ge=0.0, lt=1.0,
+        description="CrossEntropy label smoothing ∈ [0, 1). 0.1 reduces overconfidence.",
+    )
     manualSeed: int = 1111
 
     # ── Checkpointing ────────────────────────────────────────────────────────

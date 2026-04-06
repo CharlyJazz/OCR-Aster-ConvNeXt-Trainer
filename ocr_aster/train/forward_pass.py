@@ -23,6 +23,7 @@ def forward_pass(
     converter: AttnLabelConverter,
     teacher_forcing_ratio: float,
     device: torch.device,
+    label_smoothing: float = 0.0,
 ) -> tuple[Tensor, Tensor]:
     """
     One forward pass with AMP + attention cross-entropy loss.
@@ -36,6 +37,8 @@ def forward_pass(
         converter:             AttnLabelConverter (for EOS index)
         teacher_forcing_ratio: τ ∈ [0, 1]
         device:                compute device
+        label_smoothing:       ∈ [0, 1). 0.0 = standard CE, 0.1 = soft targets.
+                               Reduces overconfidence and improves calibration.
 
     Returns:
         loss:  scalar tensor
@@ -52,12 +55,11 @@ def forward_pass(
         )
         # logits: (B, max_len, num_classes)
 
-        # Cross-entropy loss over all positions
-        # text_for_loss[:, :max_len] are the targets (chars + EOS)
         loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),          # (B*max_len, C)
-            text_for_loss[:, :batch_max_length].reshape(-1),  # (B*max_len,)
-            ignore_index=0,  # ignore GO token if it appears as padding
+            logits.reshape(-1, logits.size(-1)),               # (B*max_len, C)
+            text_for_loss[:, :batch_max_length].reshape(-1),   # (B*max_len,)
+            ignore_index=0,
+            label_smoothing=label_smoothing,
         )
 
     preds = logits.detach().argmax(dim=-1)  # (B, max_len)

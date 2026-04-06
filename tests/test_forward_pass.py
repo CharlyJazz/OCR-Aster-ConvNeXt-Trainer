@@ -84,3 +84,28 @@ def test_loss_changes_with_tf_ratio(model, batch, converter):
                             converter, 0.0, DEVICE)
     # With TF=0.0 the model feeds its own (random) predictions — loss will differ
     assert not torch.isclose(loss1, loss2), "Loss identical for TF=1.0 and TF=0.0"
+
+
+def test_label_smoothing_changes_loss(model, batch, converter):
+    """Label smoothing > 0 should produce a different loss than 0."""
+    images, pred, loss_t, lengths = batch
+    torch.manual_seed(0)
+    loss_no_smooth, _ = forward_pass(model, images, pred, loss_t, lengths,
+                                     converter, 1.0, DEVICE, label_smoothing=0.0)
+    torch.manual_seed(0)
+    loss_smooth, _ = forward_pass(model, images, pred, loss_t, lengths,
+                                  converter, 1.0, DEVICE, label_smoothing=0.1)
+    assert not torch.isclose(loss_no_smooth, loss_smooth), \
+        "Loss unchanged with label_smoothing=0.1"
+
+
+def test_label_smoothing_zero_matches_default(model, batch, converter):
+    """label_smoothing=0.0 must be identical to the default (no arg)."""
+    images, pred, loss_t, lengths = batch
+    torch.manual_seed(0)
+    loss_default, _ = forward_pass(model, images, pred, loss_t, lengths,
+                                   converter, 1.0, DEVICE)
+    torch.manual_seed(0)
+    loss_explicit, _ = forward_pass(model, images, pred, loss_t, lengths,
+                                    converter, 1.0, DEVICE, label_smoothing=0.0)
+    assert torch.isclose(loss_default, loss_explicit)

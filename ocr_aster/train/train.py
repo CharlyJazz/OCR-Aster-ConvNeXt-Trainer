@@ -425,6 +425,7 @@ def train(config_path: str) -> None:
         loss, _ = forward_pass(
             model, images_tensor, text_for_pred, text_for_loss,
             lengths, converter, tf_ratio, device,
+            label_smoothing=config.label_smoothing,
         )
 
         optimizer.zero_grad(set_to_none=True)
