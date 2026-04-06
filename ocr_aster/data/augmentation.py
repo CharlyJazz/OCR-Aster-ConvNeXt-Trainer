@@ -1,219 +1,399 @@
 """
 Image augmentation pipeline for OCR training.
 
-Augmentation is applied in publisher threads before images reach the GPU.
-The level string ("off" / "low" / "medium" / "high" / "all") controls which
-transforms are active and at what probability.
+Uses the real STRAug library and Albumentations with the same configuration
+that was battle-tested in the private chord-OCR training runs.
 
-All transforms operate on a PIL Image (grayscale, mode "L") and return a PIL Image.
-The final conversion to a normalised float tensor is handled by the collate step.
+Key design points (ported from private repo):
+  1. STRAug transforms are grouped — only ONE per group is applied per image
+     (pattern / blur / camera / geometry / etc.). This prevents stacking too
+     many transforms of the same family and destroying legibility.
+  2. 3-retry loop for STRAug: if a transform produces a near-black image,
+     a different random transform from the same groups is tried up to 3 times.
+  3. Albumentations pipeline is applied BEFORE STRAug.
+  4. Parameters are deliberately conservative (soft mag, low prob) to avoid
+     the black-image artefacts that plagued earlier training runs.
+
+Two construction modes:
+
+    AugmentationPipeline(level="medium")
+        Level-based preset — used when no per-phase transform lists are given.
+
+    AugmentationPipeline.from_lists(
+        level="high",
+        straug_augs=["Grid", "VGrid", "MotionBlur", "JpegCompression"],
+        albumentations_augs=["PixelDropout", "OpticalDistortion"],
+    )
+        Explicit named lists — mirrors the per-phase YAML format.
+
+All transforms operate on PIL Images (mode "L").
 """
 
 from __future__ import annotations
 
+import logging
 import random
-from typing import Callable
+from functools import partial
+from typing import Callable, List, Optional
 
-from PIL import Image, ImageFilter, ImageOps
+import albumentations as A
+import numpy as np
+from PIL import Image
 
-# albumentations is imported lazily so the module loads even without GPU env
+# ---------------------------------------------------------------------------
+# STRAug imports — lazy try/except so unit tests still run if somehow absent
+# ---------------------------------------------------------------------------
 try:
-    import albumentations as A
-    import numpy as np
-    _HAVE_ALBUMENTATIONS = True
+    from straug.blur import DefocusBlur, GaussianBlur, GlassBlur, MotionBlur, ZoomBlur
+    from straug.camera import Brightness, Contrast, JpegCompression, Pixelate
+    from straug.geometry import Perspective as StraugPerspective
+    from straug.geometry import Rotate, Shrink
+    from straug.noise import GaussianNoise, ImpulseNoise, ShotNoise, SpeckleNoise
+    from straug.pattern import EllipseGrid, Grid, HGrid, RectGrid, VGrid
+    from straug.process import (
+        AutoContrast, Color, Equalize, Invert, Posterize, Sharpness, Solarize
+    )
+    from straug.warp import Curve, Distort, Stretch
+    from straug.weather import Fog, Frost, Rain, Shadow, Snow
+    _HAVE_STRAUG = True
 except ImportError:
-    _HAVE_ALBUMENTATIONS = False
+    _HAVE_STRAUG = False
+    logging.warning("straug not installed — STRAug transforms will be skipped")
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Individual transforms (PIL-based, no extra deps)
+# Black-image detector (prevents augmentations from destroying images)
 # ---------------------------------------------------------------------------
 
-def _random_blur(p: float) -> Callable[[Image.Image], Image.Image]:
-    def transform(img: Image.Image) -> Image.Image:
-        if random.random() < p:
-            radius = random.uniform(0.5, 1.5)
-            img = img.filter(ImageFilter.GaussianBlur(radius=radius))
-        return img
-    return transform
+def is_image_mostly_black(
+    img: Image.Image,
+    std_threshold: float = 0.02,
+    darkness_threshold: float = 0.95,
+) -> bool:
+    """
+    Returns True if the image is nearly uniform AND dark.
 
+    A near-black image (uniform dark pixels) indicates a failed augmentation.
+    Threshold values are conservative — only truly degenerate images are flagged.
 
-def _random_motion_blur(p: float) -> Callable[[Image.Image], Image.Image]:
-    def transform(img: Image.Image) -> Image.Image:
-        if random.random() < p:
-            # Approximate motion blur with a directional box filter
-            size = random.choice([3, 5])
-            img = img.filter(ImageFilter.BoxBlur(size))
-        return img
-    return transform
-
-
-def _random_noise(p: float, amount: float = 0.02) -> Callable[[Image.Image], Image.Image]:
-    def transform(img: Image.Image) -> Image.Image:
-        if random.random() < p:
-            import numpy as np
-            arr = np.array(img, dtype=np.int16)
-            noise = np.random.normal(0, amount * 255, arr.shape).astype(np.int16)
-            arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-            return Image.fromarray(arr, mode="L")
-        return img
-    return transform
-
-
-def _random_perspective(p: float, distortion: float = 0.1) -> Callable[[Image.Image], Image.Image]:
-    def transform(img: Image.Image) -> Image.Image:
-        if random.random() < p:
-            w, h = img.size
-            d = int(distortion * min(w, h))
-            coeffs = _find_perspective_coeffs(
-                [(0, 0), (w, 0), (w, h), (0, h)],
-                [
-                    (random.randint(0, d), random.randint(0, d)),
-                    (w - random.randint(0, d), random.randint(0, d)),
-                    (w - random.randint(0, d), h - random.randint(0, d)),
-                    (random.randint(0, d), h - random.randint(0, d)),
-                ],
-            )
-            img = img.transform(img.size, Image.PERSPECTIVE, coeffs, Image.BICUBIC)
-        return img
-    return transform
-
-
-def _find_perspective_coeffs(
-    src: list[tuple[int, int]], dst: list[tuple[int, int]]
-) -> list[float]:
-    """Compute 8 coefficients for PIL perspective transform."""
-    import numpy as np
-    matrix = []
-    for p1, p2 in zip(dst, src):
-        matrix.append([p1[0], p1[1], 1, 0, 0, 0, -p2[0] * p1[0], -p2[0] * p1[1]])
-        matrix.append([0, 0, 0, p1[0], p1[1], 1, -p2[1] * p1[0], -p2[1] * p1[1]])
-    A_mat = np.array(matrix, dtype=float)
-    B_vec = np.array([x for pair in src for x in pair], dtype=float).reshape(8)
-    res = np.linalg.solve(A_mat, B_vec)
-    return list(res.flatten())
-
-
-def _random_threshold(p: float) -> Callable[[Image.Image], Image.Image]:
-    def transform(img: Image.Image) -> Image.Image:
-        if random.random() < p:
-            threshold = random.randint(100, 180)
-            img = img.point(lambda x: 255 if x > threshold else 0)
-        return img
-    return transform
-
-
-def _random_jpeg_quality(p: float, min_q: int = 40) -> Callable[[Image.Image], Image.Image]:
-    """Simulate JPEG compression artefacts."""
-    def transform(img: Image.Image) -> Image.Image:
-        if random.random() < p:
-            import io
-            q = random.randint(min_q, 85)
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=q)
-            buf.seek(0)
-            img = Image.open(buf).convert("L")
-        return img
-    return transform
+    Args:
+        std_threshold:    below this std the image is considered uniform
+        darkness_threshold: if mean < this value it is considered dark
+                           (0.95 = catch everything except near-white images)
+    """
+    arr = np.array(img, dtype=np.float32) / 255.0
+    std_dev = float(np.std(arr))
+    mean_val = float(np.mean(arr))
+    return std_dev < std_threshold and mean_val < darkness_threshold
 
 
 # ---------------------------------------------------------------------------
-# Albumentations-based transforms (optional, require numpy)
+# STRAug transform registry
+# Soft parameters (mag=0 or mag=1, low prob) to preserve legibility.
 # ---------------------------------------------------------------------------
 
-def _albu_optical_distortion(p: float) -> Callable[[Image.Image], Image.Image] | None:
-    if not _HAVE_ALBUMENTATIONS:
-        return None
+_STRAUG_MAP: dict[str, Callable] = {}
 
-    transform = A.OpticalDistortion(p=1.0)
+if _HAVE_STRAUG:
+    _STRAUG_MAP = {
+        # Pattern (grid artefacts simulating LCD/screen noise)
+        "Grid":           lambda: partial(Grid(),           mag=0, prob=0.2),
+        "VGrid":          lambda: partial(VGrid(),          mag=0, prob=0.2, max_width=1),
+        "HGrid":          lambda: partial(HGrid(),          mag=0, prob=0.2, max_width=1),
+        "RectGrid":       lambda: partial(RectGrid(),       mag=0, prob=0.2),
+        "EllipseGrid":    lambda: partial(EllipseGrid(),    mag=0, prob=0.2),
+        # Blur
+        "GaussianBlur":   lambda: partial(GaussianBlur(),   mag=1, prob=0.4),
+        "DefocusBlur":    lambda: partial(DefocusBlur(),    mag=1, prob=0.4),
+        "MotionBlur":     lambda: partial(MotionBlur(),     mag=1, prob=0.4),
+        "GlassBlur":      lambda: partial(GlassBlur(),      mag=1, prob=0.3),
+        "ZoomBlur":       lambda: partial(ZoomBlur(),       mag=1, prob=0.3),
+        # Noise
+        "GaussianNoise":  lambda: partial(GaussianNoise(),  mag=1, prob=0.4),
+        "ShotNoise":      lambda: partial(ShotNoise(),      mag=1, prob=0.4),
+        "ImpulseNoise":   lambda: partial(ImpulseNoise(),   mag=1, prob=0.3),
+        "SpeckleNoise":   lambda: partial(SpeckleNoise(),   mag=1, prob=0.4),
+        # Weather
+        "Fog":            lambda: partial(Fog(),            mag=1, prob=0.3),
+        "Snow":           lambda: partial(Snow(),           mag=1, prob=0.3),
+        "Frost":          lambda: partial(Frost(),          mag=1, prob=0.3),
+        "Rain":           lambda: partial(Rain(),           mag=1, prob=0.3),
+        "Shadow":         lambda: partial(Shadow(),         mag=1, prob=0.4),
+        # Camera
+        "Contrast":       lambda: partial(Contrast(),       mag=1, prob=0.4),
+        "Brightness":     lambda: partial(Brightness(),     mag=1, prob=0.4),
+        "JpegCompression": lambda: partial(JpegCompression(), mag=1, prob=0.6),
+        "Pixelate":       lambda: partial(Pixelate(),       mag=1, prob=0.4),
+        # Warp
+        "Curve":          lambda: partial(Curve(),          mag=1, prob=0.3),
+        "Distort":        lambda: partial(Distort(),        mag=1, prob=0.3),
+        "Stretch":        lambda: partial(Stretch(),        mag=1, prob=0.3),
+        # Geometry
+        "StraugPerspective": lambda: partial(StraugPerspective(), mag=1, prob=0.3),
+        "Rotate":         lambda: partial(Rotate(),         mag=1, prob=0.3),
+        "Shrink":         lambda: partial(Shrink(),         mag=1, prob=0.3),
+        # Process
+        "Posterize":      lambda: partial(Posterize(),      mag=1, prob=0.3),
+        "Solarize":       lambda: partial(Solarize(),       mag=1, prob=0.3),
+        "Invert":         lambda: partial(Invert(),         mag=1, prob=0.2),
+        "Equalize":       lambda: partial(Equalize(),       mag=1, prob=0.3),
+        "AutoContrast":   lambda: partial(AutoContrast(),   mag=1, prob=0.3),
+        "Sharpness":      lambda: partial(Sharpness(),      mag=1, prob=0.4),
+        "Color":          lambda: partial(Color(),          mag=1, prob=0.4),
+    }
 
-    def apply(img: Image.Image) -> Image.Image:
-        if random.random() < p:
-            arr = np.array(img)
-            arr = transform(image=arr)["image"]
-            img = Image.fromarray(arr)
-        return img
-
-    return apply
-
-
-def _albu_pixel_dropout(p: float) -> Callable[[Image.Image], Image.Image] | None:
-    if not _HAVE_ALBUMENTATIONS:
-        return None
-
-    transform = A.PixelDropout(dropout_prob=0.02, p=1.0)
-
-    def apply(img: Image.Image) -> Image.Image:
-        if random.random() < p:
-            arr = np.array(img)
-            arr = transform(image=arr)["image"]
-            img = Image.fromarray(arr)
-        return img
-
-    return apply
-
-
-# ---------------------------------------------------------------------------
-# Pipeline factory
-# ---------------------------------------------------------------------------
-
-# Level → (blur_p, motion_p, noise_p, perspective_p, threshold_p, jpeg_p,
-#           optical_p, dropout_p)
-_LEVEL_PARAMS: dict[str, tuple[float, ...]] = {
-    "off":    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-    "low":    (0.1, 0.0, 0.1, 0.05, 0.1, 0.1, 0.0, 0.0),
-    "medium": (0.3, 0.2, 0.3, 0.2,  0.2, 0.2, 0.1, 0.1),
-    "high":   (0.5, 0.4, 0.5, 0.4,  0.4, 0.3, 0.3, 0.2),
-    "all":    (0.6, 0.5, 0.6, 0.5,  0.5, 0.4, 0.4, 0.3),
+# Groups: only ONE transform per group is applied per image.
+_STRAUG_GROUPS: dict[str, list[str]] = {
+    "pattern":  ["Grid", "VGrid", "HGrid", "RectGrid", "EllipseGrid"],
+    "blur":     ["GaussianBlur", "DefocusBlur", "MotionBlur", "GlassBlur", "ZoomBlur"],
+    "noise":    ["GaussianNoise", "ShotNoise", "ImpulseNoise", "SpeckleNoise"],
+    "weather":  ["Fog", "Snow", "Frost", "Rain", "Shadow"],
+    "camera":   ["Contrast", "Brightness", "JpegCompression", "Pixelate"],
+    "warp":     ["Curve", "Distort", "Stretch"],
+    "geometry": ["StraugPerspective", "Rotate", "Shrink"],
+    "process":  ["Posterize", "Solarize", "Invert", "Equalize",
+                 "AutoContrast", "Sharpness", "Color"],
 }
 
 
+# ---------------------------------------------------------------------------
+# Albumentations registry — soft parameters
+# ---------------------------------------------------------------------------
+
+_ALBUMENTATIONS_MAP: dict[str, Callable[[], A.BasicTransform]] = {
+    "ImageCompression": lambda: A.ImageCompression(
+        quality_range=(70, 95), compression_type="jpeg", p=0.6
+    ),
+    "Perspective": lambda: A.Perspective(scale=(0.01, 0.05), p=0.5),
+    "MotionBlur":  lambda: A.MotionBlur(blur_limit=(3, 7), p=0.4),
+    "Defocus":     lambda: A.Defocus(radius=(1, 3), alias_blur=(0.1, 0.3), p=0.3),
+    "OpticalDistortion": lambda: A.OpticalDistortion(distort_limit=0.2, p=0.3),
+    "PixelDropout": lambda: A.PixelDropout(
+        dropout_prob=0.01, per_channel=False, drop_value=0, p=0.3
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _select_straug_per_image(names: list[str]) -> list:
+    """
+    From a list of STRAug transform names, randomly pick ONE per group
+    and return instantiated transform callables.
+
+    Called per-image so each image gets a different random selection.
+    """
+    if not _HAVE_STRAUG:
+        return []
+
+    # Bucket requested names into their groups
+    groups_present: dict[str, list[str]] = {}
+    for name in names:
+        for group, members in _STRAUG_GROUPS.items():
+            if name in members:
+                groups_present.setdefault(group, []).append(name)
+                break
+
+    # Pick one per group and instantiate
+    transforms = []
+    for group, members in groups_present.items():
+        chosen = random.choice(members)
+        if chosen in _STRAUG_MAP:
+            try:
+                transforms.append(_STRAUG_MAP[chosen]())
+            except Exception as e:
+                logger.warning(f"STRAug init error for '{chosen}': {e}")
+
+    return transforms
+
+
+def _build_albumentations_pipeline(names: list[str]) -> A.Compose | None:
+    """Build an Albumentations Compose from a list of names."""
+    transforms = []
+    for name in names:
+        if name in _ALBUMENTATIONS_MAP:
+            try:
+                transforms.append(_ALBUMENTATIONS_MAP[name]())
+            except Exception as e:
+                logger.warning(f"Albumentations init error for '{name}': {e}")
+        else:
+            logger.warning(f"Unknown albumentations aug '{name}'")
+    return A.Compose(transforms) if transforms else None
+
+
+def _apply_albumentations(
+    img: Image.Image, pipeline: A.Compose
+) -> Image.Image:
+    """Apply an Albumentations pipeline to a grayscale PIL Image."""
+    arr = np.array(img)  # (H, W) uint8
+    # Albumentations expects 3-channel input
+    arr3 = np.stack([arr, arr, arr], axis=-1)
+    result = pipeline(image=arr3)["image"]
+    # Convert back to grayscale
+    grey = np.mean(result, axis=-1).astype(np.uint8)
+    return Image.fromarray(grey, mode="L")
+
+
+def _apply_straug(img: Image.Image, transforms: list) -> Image.Image:
+    """Apply a list of STRAug transforms to a grayscale PIL Image."""
+    for t in transforms:
+        img = t(img)
+    # STRAug may return RGB — normalise back to L
+    if img.mode != "L":
+        img = img.convert("L")
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Level-based presets (fallback when no explicit transform lists are given)
+# ---------------------------------------------------------------------------
+
+# For level-based mode we use a curated set of STRAug names per level.
+_LEVEL_STRAUG: dict[str, list[str]] = {
+    "off":    [],
+    "low":    ["Grid", "JpegCompression", "Brightness"],
+    "medium": ["Grid", "VGrid", "JpegCompression", "StraugPerspective",
+               "MotionBlur", "Brightness"],
+    "high":   ["Grid", "VGrid", "HGrid", "RectGrid", "JpegCompression",
+               "StraugPerspective", "MotionBlur", "DefocusBlur", "Pixelate"],
+    "all":    ["Grid", "VGrid", "HGrid", "RectGrid", "JpegCompression",
+               "StraugPerspective", "MotionBlur", "DefocusBlur", "Pixelate",
+               "GaussianBlur", "Brightness", "Contrast"],
+}
+
+_LEVEL_ALBU: dict[str, list[str]] = {
+    "off":    [],
+    "low":    [],
+    "medium": ["PixelDropout"],
+    "high":   ["PixelDropout", "OpticalDistortion"],
+    "all":    ["PixelDropout", "OpticalDistortion"],
+}
+
+
+# ---------------------------------------------------------------------------
+# AugmentationPipeline — public class
+# ---------------------------------------------------------------------------
+
 class AugmentationPipeline:
     """
-    Composes a list of probabilistic PIL image transforms.
+    Probabilistic OCR augmentation pipeline.
 
-    Args:
-        level: one of "off", "low", "medium", "high", "all"
+    Applies (in order):
+      1. Albumentations pipeline (once per image)
+      2. STRAug — one transform per group, chosen randomly per image
+         with up to 3 retries if output is near-black
+
+    Construct via:
+        AugmentationPipeline(level="medium")         # level preset
+        AugmentationPipeline.from_lists(             # explicit named transforms
+            level="high",
+            straug_augs=["Grid", "MotionBlur"],
+            albumentations_augs=["PixelDropout"],
+        )
     """
 
     def __init__(self, level: str = "medium") -> None:
-        if level not in _LEVEL_PARAMS:
-            raise ValueError(f"Unknown augmentation level {level!r}. "
-                             f"Choose from {list(_LEVEL_PARAMS)}")
+        valid = set(_LEVEL_STRAUG)
+        if level not in valid:
+            raise ValueError(
+                f"Unknown augmentation level {level!r}. Choose from {sorted(valid)}"
+            )
         self.level = level
-        (blur_p, motion_p, noise_p, persp_p,
-         thresh_p, jpeg_p, optical_p, drop_p) = _LEVEL_PARAMS[level]
+        self._straug_names: list[str] = _LEVEL_STRAUG[level]
+        self._albu_pipeline: A.Compose | None = _build_albumentations_pipeline(
+            _LEVEL_ALBU[level]
+        )
 
-        self._transforms: list[Callable[[Image.Image], Image.Image]] = []
+    @classmethod
+    def from_lists(
+        cls,
+        level: str = "medium",
+        straug_augs: list[str] | None = None,
+        albumentations_augs: list[str] | None = None,
+    ) -> "AugmentationPipeline":
+        """
+        Build from explicit named transform lists (per-phase YAML format).
 
-        if blur_p > 0:
-            self._transforms.append(_random_blur(blur_p))
-        if motion_p > 0:
-            self._transforms.append(_random_motion_blur(motion_p))
-        if noise_p > 0:
-            self._transforms.append(_random_noise(noise_p))
-        if persp_p > 0:
-            self._transforms.append(_random_perspective(persp_p))
-        if thresh_p > 0:
-            self._transforms.append(_random_threshold(thresh_p))
-        if jpeg_p > 0:
-            self._transforms.append(_random_jpeg_quality(jpeg_p))
+        Falls back to level preset if both lists are empty.
+        """
+        straug_augs = straug_augs or []
+        albumentations_augs = albumentations_augs or []
 
-        # Optional albumentations transforms
-        if optical_p > 0:
-            t = _albu_optical_distortion(optical_p)
-            if t is not None:
-                self._transforms.append(t)
-        if drop_p > 0:
-            t = _albu_pixel_dropout(drop_p)
-            if t is not None:
-                self._transforms.append(t)
+        if not straug_augs and not albumentations_augs:
+            return cls(level=level)
+
+        obj = object.__new__(cls)
+        obj.level = level
+        obj._straug_names = list(straug_augs)
+
+        # Validate STRAug names
+        all_straug = {n for members in _STRAUG_GROUPS.values() for n in members}
+        for name in straug_augs:
+            if name not in all_straug:
+                raise ValueError(
+                    f"Unknown straug_aug {name!r}. Valid: {sorted(all_straug)}"
+                )
+
+        obj._albu_pipeline = _build_albumentations_pipeline(albumentations_augs)
+        return obj
 
     def __call__(self, img: Image.Image) -> Image.Image:
-        """Apply pipeline to a PIL Image (mode "L"). Returns PIL Image."""
-        for t in self._transforms:
-            img = t(img)
+        """
+        Apply the full augmentation pipeline to a PIL Image (mode "L").
+
+        Returns a PIL Image (mode "L") of the same size.
+        """
+        img = img.convert("L")
+
+        # Step 1: Albumentations (once, no retry needed — params are soft)
+        if self._albu_pipeline is not None:
+            img_before = img.copy()
+            try:
+                candidate = _apply_albumentations(img, self._albu_pipeline)
+                if not is_image_mostly_black(candidate):
+                    img = candidate
+                else:
+                    logger.debug("Albumentations produced near-black image, skipping")
+                    img = img_before
+            except Exception as e:
+                logger.debug(f"Albumentations error: {e}")
+
+        # Step 2: STRAug — one per group, 3-retry anti-black loop
+        if self._straug_names and _HAVE_STRAUG:
+            img_before_straug = img.copy()
+            applied = False
+            for attempt in range(3):
+                transforms = _select_straug_per_image(self._straug_names)
+                if not transforms:
+                    break
+                try:
+                    candidate = _apply_straug(img_before_straug.copy(), transforms)
+                    if not is_image_mostly_black(candidate):
+                        img = candidate
+                        applied = True
+                        break
+                    else:
+                        if attempt < 2:
+                            logger.debug(
+                                f"STRAug attempt {attempt + 1}/3 near-black, retrying"
+                            )
+                        else:
+                            logger.debug("STRAug: all 3 attempts near-black, keeping pre-STRAug image")
+                except Exception as e:
+                    logger.debug(f"STRAug attempt {attempt + 1} error: {e}")
+
+            if not applied:
+                img = img_before_straug
+
         return img
 
     def __repr__(self) -> str:
-        return f"AugmentationPipeline(level={self.level!r}, transforms={len(self._transforms)})"
+        return (
+            f"AugmentationPipeline(level={self.level!r}, "
+            f"straug={self._straug_names}, "
+            f"albu={'yes' if self._albu_pipeline else 'none'})"
+        )

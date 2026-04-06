@@ -106,6 +106,7 @@ class HFPublisher:
 
         aug_level = config.augmentation.level if augment else "off"
         self._augmentation = AugmentationPipeline(level=aug_level)
+        self._augmentation_lock = threading.Lock()
 
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
@@ -122,6 +123,29 @@ class HFPublisher:
             list of (PIL Image, label_str) pairs, length == batch_size
         """
         return self._queue.get(timeout=timeout)
+
+    def update_phase(self, iteration: int) -> None:
+        """
+        Call from the training loop when the iteration counter advances.
+
+        Checks if the active curriculum phase has changed and, if so,
+        rebuilds the augmentation pipeline from that phase's transform lists.
+        """
+        if not self._augment:
+            return
+        phase = self._config.active_phase(iteration)
+        if phase is None:
+            return
+        if not phase.data_augmentation:
+            new_aug = AugmentationPipeline(level="off")
+        else:
+            new_aug = AugmentationPipeline.from_lists(
+                level=phase.data_augmentation_level,
+                straug_augs=phase.straug_augs,
+                albumentations_augs=phase.albumentations_augs,
+            )
+        with self._augmentation_lock:
+            self._augmentation = new_aug
 
     def stop(self) -> None:
         """Signal the worker thread to stop."""
@@ -156,7 +180,9 @@ class HFPublisher:
 
             if self._augment:
                 try:
-                    img = self._augmentation(img)
+                    with self._augmentation_lock:
+                        aug = self._augmentation
+                    img = aug(img)
                 except Exception:
                     pass  # augmentation errors are non-fatal
 

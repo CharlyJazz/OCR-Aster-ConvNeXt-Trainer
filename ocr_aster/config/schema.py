@@ -58,25 +58,50 @@ class PhaseConfig(BaseModel):
     """
     A curriculum learning phase. Training transitions to the next phase
     automatically when `from_iter` is reached.
+
+    Augmentation is declared per-phase via two complementary lists:
+    - `straug_augs`:        STRAug-style transforms (Grid, MotionBlur, etc.)
+    - `albumentations_augs`: Albumentations transforms (PixelDropout, etc.)
+
+    If both lists are empty, `data_augmentation_level` is used as a fallback.
     """
 
     model_config = {"extra": "forbid"}
 
     name: str
+    title: str = ""
     from_iter: int = Field(..., ge=0)
     to_iter: int = Field(..., gt=0)
     batch_size: int = Field(..., gt=0)
     lr: float = Field(..., gt=0.0)
-    augmentation_level: str = Field(
+
+    # Augmentation control
+    data_augmentation: bool = True
+    data_augmentation_level: str = Field(
         "medium",
         pattern="^(off|low|medium|high|all)$",
+        description="Fallback level when straug_augs/albumentations_augs are empty",
     )
+    straug_augs: list[str] = Field(
+        default_factory=list,
+        description="Named STRAug transforms: Grid, VGrid, HGrid, RectGrid, "
+                    "JpegCompression, StraugPerspective, MotionBlur, DefocusBlur, "
+                    "Pixelate, Brightness, Contrast",
+    )
+    albumentations_augs: list[str] = Field(
+        default_factory=list,
+        description="Named albumentations transforms: PixelDropout, OpticalDistortion",
+    )
+
     # Optional lambda filter on samples for this phase
     # e.g. "lambda s: len(s['label']) <= 6"
     dataset_filter: str | None = None
 
+    # Optional per-phase description (human-readable only)
+    description: str = ""
+
     @model_validator(mode="after")
-    def to_iter_after_from_iter(self) -> PhaseConfig:
+    def to_iter_after_from_iter(self) -> "PhaseConfig":
         if self.to_iter <= self.from_iter:
             raise ValueError(
                 f"Phase '{self.name}': to_iter ({self.to_iter}) must be > from_iter ({self.from_iter})"
